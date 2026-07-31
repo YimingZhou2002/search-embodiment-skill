@@ -13,7 +13,8 @@ children**.
 
 **Golden rule:** minimize `step_time_per_traj_s` under preflight + OOM constraints.
 Short trials. Never launch a duplicate or preflight-invalid config. Propose from
-evidence (each node's `diagnosis.json`), never guess.
+evidence (each node's `diagnosis.json`), never guess. **Every OK trial MUST produce
+a `REPORT.md` before the next trial launches — no exceptions.**
 
 ## Cost — read first
 
@@ -46,7 +47,7 @@ Pick `CAMPAIGN=$RLINF_ROOT/logs/search_$(date +%Y%m%d-%H%M%S)` and `mkdir -p` it
 ### 1. Cold start — evaluate the baseline
 Run the baseline config as one node (see "Launch a trial" below) with **no
 overrides**, log dir `$CAMPAIGN/node_0-baseline`. After it's diagnosed, register
-the root:
+the root, then **immediately write its `REPORT.md`** (see [Write per-node REPORT.md](#write-per-node-reportmd)):
 
 ```bash
 python "$SKILL/helpers/search_store.py" init \
@@ -63,32 +64,49 @@ For `r` in `1..ROUNDS`:
    python "$SKILL/helpers/search_store.py" frontier --campaign-dir "$CAMPAIGN" --k 2 --max-children 2
    ```
 2. **Propose** — for each frontier node, read `<node.log_dir>/diagnosis.json` and
-   `REPORT.md`, and propose `BRANCH` knob deltas using
+   **`REPORT.md`** (both must exist; if REPORT.md is missing, stop and write it first —
+   the diagnosis and report together are the evidence for the next proposals). Then
+   propose `BRANCH` knob deltas using
    [`reference/search-recipe.md`](reference/search-recipe.md),
    [`reference/knob-schema.md`](reference/knob-schema.md), and
    [`reference/diagnosis-playbook.md`](reference/diagnosis-playbook.md).
    Each delta is a small JSON of hydra overrides, e.g.
    `{"env.train.enable_offload": false}`.
 3. **For each proposal** `d` on parent `P` (up to `BEAM×BRANCH` = 4):
-   - **dedup:** `search_store.py dedup --campaign-dir "$CAMPAIGN" --parent P --overrides '<d>'`.
-     If `duplicate`, skip the run (reuse the known objective); optionally record a
-     `--status DUPLICATE` node for provenance. Propose a different delta.
-   - **preflight:** `python "$SKILL/helpers/preflight.py" --overrides '<d>'`
-     (or pass the resolved config). If invalid, record it without running:
-     `search_store.py add … --status FAILED --failure CONFIG_INVALID`; propose another.
-   - **launch trial** `d` (see below) into `$CAMPAIGN/node_<next>-<tag>`, then:
-     ```bash
-     NID=$(python "$SKILL/helpers/search_store.py" add --campaign-dir "$CAMPAIGN" \
-       --parent P --overrides '<d>' --round r --tag <tag> \
-       --log-dir "$CAMPAIGN/node_<next>-<tag>" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
-     python "$SKILL/helpers/search_store.py" set-result --campaign-dir "$CAMPAIGN" \
-       --id "$NID" --from-diagnosis "$CAMPAIGN/node_<next>-<tag>/diagnosis.json"
-     ```
-     (Add the node *before* launching if you prefer the id for the dir name — either
-     order is fine as long as `--log-dir` matches where the trial actually wrote.)
-4. **Report round:** `search_store.py tree --campaign-dir "$CAMPAIGN"` — show the tree
-   + leaderboard to the user. If no new node beat the best (all dup/invalid/OOM/
-   slower), you may stop early (note the plateau).
+   a. **dedup:** `search_store.py dedup --campaign-dir "$CAMPAIGN" --parent P --overrides '<d>'`.
+      If `duplicate`, skip the run (reuse the known objective); optionally record a
+      `--status DUPLICATE` node for provenance. Propose a different delta.
+   b. **preflight:** `python "$SKILL/helpers/preflight.py" --overrides '<d>'`
+      (or pass the resolved config). If invalid, record it without running:
+      `search_store.py add … --status FAILED --failure CONFIG_INVALID`; propose another.
+   c. **Launch trial** `d` (see "Launch a trial" below) into `$CAMPAIGN/node_<next>-<tag>`,
+      then plot, diagnose, and register:
+      ```bash
+      NID=$(python "$SKILL/helpers/search_store.py" add --campaign-dir "$CAMPAIGN" \
+        --parent P --overrides '<d>' --round r --tag <tag> \
+        --log-dir "$CAMPAIGN/node_<next>-<tag>" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+      python "$SKILL/helpers/search_store.py" set-result --campaign-dir "$CAMPAIGN" \
+        --id "$NID" --from-diagnosis "$CAMPAIGN/node_<next>-<tag>/diagnosis.json"
+      ```
+      (Add the node *before* launching if you prefer the id for the dir name — either
+      order is fine as long as `--log-dir` matches where the trial actually wrote.)
+   d. **★ WRITE `$NODE_DIR/REPORT.md` NOW — before launching the next trial.** Do NOT
+      defer this to the end of the round. See [Write per-node REPORT.md](#write-per-node-reportmd)
+      for the full step-by-step. Every OK trial that skips this step breaks the search:
+      the next round's proposals depend on each parent node's REPORT.md for evidence.
+4. **Round checkpoint** — before reporting, verify every trial launched this round has
+   its REPORT.md. If any is missing, stop and write it NOW:
+   ```bash
+   for d in "$CAMPAIGN"/node_*; do
+     [ -f "$d/REPORT.md" ] || echo "MISSING REPORT.md: $d — write it before proceeding"
+   done
+   ```
+   Do NOT proceed to the round report with missing per-node reports.
+5. **Report round:** `search_store.py tree --campaign-dir "$CAMPAIGN"` — show the tree
+   + leaderboard to the user. Fill or update the SEARCH_REPORT.md file according to
+   [`reference/search-report-template.md`](reference/search-report-template.md).
+   If no new node beat the best (all dup/invalid/OOM/slower), you may stop early
+   (note the plateau).
 
 ### 3. Finish
 ```bash
@@ -124,7 +142,7 @@ STEPS=2 RUN_LOG_DIR="$NODE_DIR" EXTRA_OVERRIDES="<OV>" \
 # after it exits: plot + diagnose (writes NODE_DIR/diagnosis.json)
 python "$SKILL/profiler/plot_timeline.py" "$NODE_DIR/timeline" -o "$NODE_DIR/timeline.png"  --format png
 python "$SKILL/profiler/plot_timeline.py" "$NODE_DIR/timeline" -o "$NODE_DIR/timeline.html"  --format html
-python "$SKILL/profiler/plot_nvitop.py"   "$NODE_DIR/nvitop"   -o "$NODE_DIR/nvitop.png"    --format png
+python "$SKILL/profiler/plot_nvitop.py"   "$NODE_DIR/nvitop"   -o "$NODE_DIR/nvitop.png"    --summary-output --format png
 python "$SKILL/profiler/plot_nvitop.py"   "$NODE_DIR/nvitop"   -o "$NODE_DIR/nvitop.html"    --format html
 python "$SKILL/helpers/diagnose.py" "$NODE_DIR"
 ```
@@ -135,7 +153,13 @@ both supported by `run_embodiment.sh` (additive passthrough). `diagnose.py` need
 here). A trial that OOMs writes no `metrics.log`; `diagnose.py` sets
 `likely_oom_before_first_step`, and `set-result` records it as FAILED/OOM.
 
-Then **write `$NODE_DIR/REPORT.md`** yourself:
+After the shell exits and `diagnosis.json` is written, proceed to
+[Write per-node REPORT.md](#write-per-node-reportmd).
+
+## Write per-node REPORT.md
+
+This section is referenced by the round loop above. After every OK trial, write
+`$NODE_DIR/REPORT.md` **immediately** — do not defer to later.
 
 1. Read `$NODE_DIR/diagnosis.json` (the extracted signals) and skim `diagnosis.txt`.
 2. Read [`reference/concepts.md`](reference/concepts.md) (domain model — per-trajectory
@@ -148,7 +172,7 @@ Then **write `$NODE_DIR/REPORT.md`** yourself:
 
 Report the headline to the user (per-trajectory time + the dominant bottleneck pattern)
 and the `REPORT.md` path. Do **not** invent numbers — everything traces to
-`diagnosis.json`.
+`diagnosis.json`,`metrics.log`, nvitop and timeline profile results.
 
 ## File index
 
@@ -171,6 +195,7 @@ and the `REPORT.md` path. Do **not** invent numbers — everything traces to
 | `reference/concepts.md` | domain model (per-trajectory metric, generation nesting, offload/OOM memory) |
 | `reference/diagnosis-playbook.md` | signal → cause → fix playbook (Patterns A–I) |
 | `reference/report-template.md` | REPORT.md structure and style rules |
+| `reference/search-report-template.md` | SEARCH_REPORT.md structure and style rules |
 
 ## Notes
 

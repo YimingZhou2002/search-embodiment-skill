@@ -44,9 +44,9 @@ actor:
 
 ---
 ## 0. (Optional) Failure analysis
-> If profile run fails present this section with a failure analysis, cite log sections that can tell the failure mode, recommend a posssible restoration approach.
+> If profile run fails present this section with a failure analysis, please read `run_embodiment.log` to determine the probable cause of the crash(e.g. divisiablity fault, OOM etc.),  cite log sections that can tell the failure mode, recommend a posssible restoration approach.
 The profile run fails due to OOM on rank * and actor/rollout/env worker, recommend enabling rollout offload.
-Or: The profile run fails due to divisiablity faults， recommend set *knob to <value>. 
+Or: The profile run fails due to divisiablity faults, recommend set *knob to <value>. 
 
 ## 1. Headline
 
@@ -86,7 +86,7 @@ note they overlap (can exceed 100%); is the gen bottleneck rollout inference
 <straggler ratios for env_interact_step / predict / actor_forward|backward;
 slowest rank; tail effect present or naturally balanced. Pattern B.>
 
-### 2.4 Offload & memory / OOM
+### 2.4 Memory modeling & Offload analysis
 <offload_cost_pct; peak mem vs total and oom_risk; per-component offload flags vs the memory model (concepts.md §5-6); is any knob near the OOM knee? Pattern C / G.>
 
 | Component | enable_offload | time_per_rank| memory_per_rank |

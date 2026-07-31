@@ -2,16 +2,17 @@
 """Node store + tree for the embodiment config search (beam search).
 
 Maintains, per campaign directory:
+  * baseline_knobs.json — baseline knob dict loaded from config YAML at init time
   * nodes.jsonl  — append-only log of nodes (source of truth, resumable)
   * tree.json    — materialized view: each node with explicit parent + children[]
 
 Each node maps: id -> config (overrides delta + resolved knobs) -> log_dir, plus
 parent/children tree links, objective (step_time_per_traj_s; lower is better),
 and status. Deterministic bookkeeping only — proposals are made by the caller
-(the skill's LLM step). Stdlib-only.
+(the skill's LLM step). Stdlib+yaml.
 
 CLI:
-    search_store.py init      --campaign-dir D --log-dir L [--overrides '{}'] [--tag baseline]
+    search_store.py init      --campaign-dir D --log-dir L --config C [--overrides '{}'] [--tag baseline]
     search_store.py add       --campaign-dir D --parent P --overrides '<json>' --log-dir L [--round R] [--tag T]
     search_store.py set-result --campaign-dir D --id I (--from-diagnosis F | --objective X [--status S] [--failure M])
     search_store.py dedup     --campaign-dir D --parent P --overrides '<json>'
@@ -20,7 +21,8 @@ CLI:
     search_store.py best      --campaign-dir D
 
 Config resolution + hashing reuse preflight.resolve so the SHA matches what
-preflight validates.
+preflight validates.  The baseline is read from a config YAML at init time and
+persisted as baseline_knobs.json so subsequent commands don't need the YAML.
 """
 from __future__ import annotations
 
@@ -31,16 +33,29 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import preflight  # sibling helper: resolve(), BASELINE_KNOBS
+import preflight  # sibling helper: resolve(), load_baseline_from_config()
 
 NODES_FILE = "nodes.jsonl"
 TREE_FILE = "tree.json"
+BASELINE_FILE = "baseline_knobs.json"
 
 # statuses / failure modes
 ST_ROOT, ST_OK, ST_FAILED, ST_DUPLICATE = "ROOT", "OK", "FAILED", "DUPLICATE"
 
 
+# --- baseline persistence ----------------------------------------------------
+
+def _load_baseline(campaign_dir):
+    """Load baseline knobs from the campaign dir, falling back to defaults."""
+    path = os.path.join(campaign_dir, BASELINE_FILE)
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    return dict(preflight._DEFAULT_KNOB_VALUES)
+
+
 # --- low-level store ---------------------------------------------------------
+
 def _nodes_path(campaign_dir):
     return os.path.join(campaign_dir, NODES_FILE)
 
@@ -85,8 +100,9 @@ def _children_map(nodes):
     return ch
 
 
-def _resolve_for(nodes_by_id, parent_id, overrides):
+def _resolve_for(campaign_dir, nodes_by_id, parent_id, overrides):
     """Cumulative resolved knobs = baseline + chain of ancestor overrides + this delta."""
+    baseline = _load_baseline(campaign_dir)
     # walk parent chain root->this, applying overrides in order
     chain = []
     cur = parent_id
@@ -97,7 +113,7 @@ def _resolve_for(nodes_by_id, parent_id, overrides):
         chain.append(n.get("overrides") or {})
         cur = n.get("parent")
     chain.reverse()
-    resolved = dict(preflight.BASELINE_KNOBS)
+    resolved = dict(baseline)
     for delta in chain:
         resolved.update(delta)
     resolved.update(overrides or {})
@@ -130,12 +146,27 @@ def _write_tree(campaign_dir, nodes):
 
 
 # --- commands ----------------------------------------------------------------
+
 def cmd_init(a):
     os.makedirs(a.campaign_dir, exist_ok=True)
     if load_nodes(a.campaign_dir):
         raise SystemExit(f"campaign already initialized: {_nodes_path(a.campaign_dir)}")
+
+    # load baseline from config YAML
+    config_path = a.config
+    if config_path:
+        baseline = preflight.load_baseline_from_config(config_path)
+    else:
+        baseline = dict(preflight._DEFAULT_KNOB_VALUES)
+
+    # persist baseline
+    with open(os.path.join(a.campaign_dir, BASELINE_FILE), "w") as f:
+        json.dump(baseline, f, indent=2)
+
     overrides = json.loads(a.overrides) if a.overrides else {}
-    resolved = _resolve_for({}, None, overrides)
+    resolved = dict(baseline)
+    resolved.update(overrides or {})
+
     node = {"id": 0, "parent": None, "overrides": overrides,
             "resolved_config": resolved, "config_sha": _sha(resolved),
             "log_dir": os.path.abspath(a.log_dir), "objective": None,
@@ -143,7 +174,8 @@ def cmd_init(a):
             "tag": a.tag or "baseline"}
     _append_node(a.campaign_dir, node)
     _write_tree(a.campaign_dir, load_nodes(a.campaign_dir))
-    print(json.dumps({"id": 0, "config_sha": node["config_sha"]}))
+    print(json.dumps({"id": 0, "config_sha": node["config_sha"],
+                      "baseline_knobs": baseline}))
 
 
 def cmd_add(a):
@@ -154,7 +186,7 @@ def cmd_add(a):
     if a.parent not in by_id:
         raise SystemExit(f"unknown parent id: {a.parent}")
     overrides = json.loads(a.overrides)
-    resolved = _resolve_for(by_id, a.parent, overrides)
+    resolved = _resolve_for(a.campaign_dir, by_id, a.parent, overrides)
     sha = _sha(resolved)
     new_id = max(n["id"] for n in nodes) + 1
     node = {"id": new_id, "parent": a.parent, "overrides": overrides,
@@ -183,7 +215,6 @@ def cmd_set_result(a):
             status, failure = ST_FAILED, "METRICS_MISSING"
         else:
             status = ST_OK
-    # rewrite: append an updated copy (append-only log; latest wins on load)
     node = dict(by_id[a.id])
     if objective is not None:
         node["objective"] = objective
@@ -191,7 +222,6 @@ def cmd_set_result(a):
         node["status"] = status
     node["failure_mode"] = failure
     _append_node(a.campaign_dir, node)
-    # collapse duplicates by id (latest wins) for the tree view
     _write_tree(a.campaign_dir, _latest(load_nodes(a.campaign_dir)))
     print(json.dumps({"id": a.id, "objective": node["objective"],
                       "status": node["status"], "failure_mode": node["failure_mode"]}))
@@ -209,7 +239,7 @@ def cmd_dedup(a):
     nodes = _latest(load_nodes(a.campaign_dir))
     by_id = _by_id(nodes)
     overrides = json.loads(a.overrides)
-    resolved = _resolve_for(by_id, a.parent, overrides)
+    resolved = _resolve_for(a.campaign_dir, by_id, a.parent, overrides)
     sha = _sha(resolved)
     for n in nodes:
         if n.get("config_sha") == sha:
@@ -221,10 +251,7 @@ def cmd_dedup(a):
 
 
 def cmd_frontier(a):
-    """Best-K OK nodes by objective (the beam). Not leaf-restricted — a strong
-    node stays expandable even if a prior child failed. `--max-children` retires
-    a node once it already has that many children (so the beam moves on to the
-    next-best instead of re-expanding an exhausted node)."""
+    """Best-K OK nodes by objective (the beam)."""
     nodes = _latest(load_nodes(a.campaign_dir))
     ch = _children_map(nodes)
     cands = [n for n in nodes
@@ -267,7 +294,6 @@ def cmd_tree(a):
     for i, r in enumerate(roots):
         out += render(r, "", i == len(roots) - 1)
     print("\n".join(out))
-    # leaderboard
     ok = sorted([n for n in nodes if n.get("status") == ST_OK
                  and n.get("objective") is not None], key=lambda x: x["objective"])
     if ok:
@@ -296,7 +322,9 @@ def main():
         p.add_argument("--campaign-dir", required=True)
 
     p = sub.add_parser("init"); add_campaign(p)
-    p.add_argument("--log-dir", required=True); p.add_argument("--overrides", default="{}")
+    p.add_argument("--log-dir", required=True)
+    p.add_argument("--config", default=None, help="Path to config YAML for baseline knobs")
+    p.add_argument("--overrides", default="{}")
     p.add_argument("--tag", default="baseline"); p.set_defaults(fn=cmd_init)
 
     p = sub.add_parser("add"); add_campaign(p)

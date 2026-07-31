@@ -33,12 +33,11 @@ mapping:
 
 | Diagnosis signal | Propose |
 |---|---|
-| Generation-bound (`generation_pct`≫`training_pct`, high `actor_idle`) | ↑ `total_num_envs`; consider disaggregating placement so training overlaps generation |
 | Too-few-envs / poor amortization (low tne, high per-traj) | ↑ `total_num_envs` (next legal multiple of 8) |
 | CPU-bound env (`cpu_saturation` env multicore, env% of gen high) | ↑ `total_num_envs`; `env.train.enable_offload=false` if headroom |
 | Offload tax + safe memory (`offload_cost_pct` high, `oom_risk=safe`) | `env.train.enable_offload=false` (never rollout under colocation) |
-| Memory headroom (`max_used_pct` low) | ↑ `micro_batch_size` (stay in {…40,80}, under OOM knee) |
-| OOM / `oom_risk=high` | ↓ `micro_batch_size`; ensure `rollout.enable_offload=true`; `gradient_checkpointing=true` |
+| Memory headroom (`max_used_pct` low) | ↑ `micro_batch_size` (ensure `global_batch_size%(micro_batch_size*actor_world)`, under OOM knee) |
+| OOM / `oom_risk=high` | ↓ `micro_batch_size`; ensure `rollout.enable_offload=true`; `actor.enable_offload==true` |
 | Rollout inference-bound (`predict%` of gen high) | ↑ `rollout` placement width; tune `pipeline_stage_num` |
 
 **Strategy over rounds** (mirrors the DAG-search wisdom):

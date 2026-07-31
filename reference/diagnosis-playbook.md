@@ -193,7 +193,7 @@ until `memory.oom_risk` leaves `safe` or env CPU saturates (Pattern F).
 
 **First-line fix:** 
 - assign more resources to the slower and more resource demanding component. e.g. raise the amount of gpus assign to the rollout.
-- Try collocate env and rollout, try set pipeline_stage_num=1 and pipeline_stage_num=2.
+- Try collocate env and rollout, first set `env: 0-7` and `rollout:0-7`, then try set pipeline_stage_num=1 and pipeline_stage_num=2 sequentially.
 
 
 ## Ranking template for the report

@@ -6,34 +6,40 @@ placement invariants enforced by rlinf/config.py, WITHOUT starting Ray or any
 GPU work. Run this before launching a trial so an invalid proposal costs zero
 GPU time (record it as FAILED/CONFIG_INVALID instead of burning ~15 min).
 
-Stdlib-only. Used both as a library (`validate`, `resolve`) and a CLI:
+Reads baseline knob values from a config YAML (--config), falling back to a
+built-in defaults dict for any knobs not found in the file.
 
-    python preflight.py --overrides '{"actor.micro_batch_size": 40}'
+Stdlib+yaml. Used both as a library (load_baseline_from_config, validate, resolve)
+and a CLI:
+
+    python preflight.py --config path/to/config.yaml --overrides '{"actor.micro_batch_size": 40}'
     python preflight.py --resolved '{...full knob dict...}'
 
 Exit code 0 = valid, 1 = invalid (violations printed).
-
-The knob domains + baseline defaults mirror examples/embodiment/config/
-maniskill_ppo_openvla.yaml (see reference/knob-schema.md). global_batch_size is
-fixed at 640 and group_size at 1 for this recipe; both are read from the
-resolved dict if present so a future un-pin still validates.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
 
-# --- baseline (default) knob values for maniskill_ppo_openvla -----------------
-BASELINE_KNOBS = {
+try:
+    import yaml
+except ImportError:
+    yaml = None  # type: ignore
+
+# --- defaults for knobs not found in the config YAML ------------------------
+_DEFAULT_KNOB_VALUES = {
     "cluster.component_placement.actor": "0-7",
-    "cluster.component_placement.env": "0-3",
-    "cluster.component_placement.rollout": "4-7",
-    "env.train.total_num_envs": 128,
+    "cluster.component_placement.env": "0-7",
+    "cluster.component_placement.rollout": "0-7",
+    "env.train.total_num_envs": 64,
     "env.train.rollout_epoch": 1,
-    "rollout.pipeline_stage_num": 2,
-    "actor.micro_batch_size": 80,
-    "actor.global_batch_size": 640,      # fixed for this recipe
-    "algorithm.group_size": 1,           # fixed for this recipe
+    "rollout.pipeline_stage_num": 1,
+    "actor.micro_batch_size": 32,
+    "actor.global_batch_size": 16384,
+    "algorithm.group_size": 8,
     "rollout.enable_offload": True,
     "env.train.enable_offload": True,
     "actor.enable_offload": True,
@@ -57,7 +63,7 @@ TUNABLE_KNOBS = {
 
 _INT_KNOBS = {
     "env.train.total_num_envs": (1, 4096),
-    "env.train.rollout_epoch": (1, 16),
+    "env.train.rollout_epoch": (1, 128),
     "rollout.pipeline_stage_num": (1, 16),
     "actor.micro_batch_size": (1, 4096),
 }
@@ -72,6 +78,100 @@ _PLACEMENT_KNOBS = {
 }
 NUM_GPUS = 8  # single-node 8xA800 envelope
 
+# --- YAML → dotted-key extraction -------------------------------------------
+
+def _flatten_yaml(d, prefix=""):
+    """Recursively flatten a nested dict to dotted-key paths.
+
+    Handles Hydra-style comma-separated keys (e.g. ``{"actor,env,rollout": val}``)
+    by splitting into multiple entries.
+    """
+    out = {}
+    if not isinstance(d, dict):
+        return out
+    for k, v in d.items():
+        # split comma-separated Hydra keys: "actor,env,rollout"
+        sub_keys = [sk.strip() for sk in str(k).split(",")]
+        for sk in sub_keys:
+            full = f"{prefix}.{sk}" if prefix else sk
+            if isinstance(v, dict) and not _is_placement_range(v):
+                out.update(_flatten_yaml(v, full))
+            else:
+                out[full] = v
+    return out
+
+
+def _is_placement_range(v):
+    """Detect if a dict value looks like a placement sub-map (has 'actor'/'env'/'rollout' keys
+    that map to GPU ranges) — these should NOT be flattened."""
+    if not isinstance(v, dict):
+        return False
+    placement_keys = {"actor", "env", "rollout"}
+    return any(k in placement_keys for k in v.keys())
+
+
+# Dotted-key → expected dotted-key in flattened YAML
+_KNOB_YAML_PATHS = {
+    "cluster.component_placement.actor":    "cluster.component_placement.actor",
+    "cluster.component_placement.env":      "cluster.component_placement.env",
+    "cluster.component_placement.rollout":  "cluster.component_placement.rollout",
+    "env.train.total_num_envs":             "env.train.total_num_envs",
+    "env.train.rollout_epoch":              "env.train.rollout_epoch",
+    "rollout.pipeline_stage_num":           "rollout.pipeline_stage_num",
+    "actor.micro_batch_size":              "actor.micro_batch_size",
+    "actor.global_batch_size":             "actor.global_batch_size",
+    "algorithm.group_size":                "algorithm.group_size",
+    "rollout.enable_offload":              "rollout.enable_offload",
+    "env.train.enable_offload":            "env.train.enable_offload",
+    "actor.enable_offload":                "actor.enable_offload",
+    "actor.fsdp_config.gradient_checkpointing": "actor.fsdp_config.gradient_checkpointing",
+}
+
+
+def _expand_placement(value):
+    """Expand 'all' → '0-{NUM_GPUS-1}', pass through explicit ranges."""
+    if value == "all":
+        return f"0-{NUM_GPUS - 1}"
+    return value
+
+
+def load_baseline_from_config(config_path: str) -> dict:
+    """Read a Hydra-style YAML config and extract tunable knob values.
+
+    Returns a dict of ``{dotted_key: value}`` suitable as a baseline for
+    ``resolve()``.  Any knob not found in the YAML falls back to
+    ``_DEFAULT_KNOB_VALUES``.
+    """
+    if yaml is None:
+        raise RuntimeError(
+            "PyYAML is required to read config files. Install: pip install pyyaml"
+        )
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"config file not found: {config_path}")
+
+    with open(config_path) as f:
+        raw = yaml.safe_load(f) or {}
+
+    flat = _flatten_yaml(raw)
+
+    knobs = {}
+    for knob_key, yaml_path in _KNOB_YAML_PATHS.items():
+        if yaml_path in flat:
+            val = flat[yaml_path]
+            # expand "all" placement
+            if knob_key in _PLACEMENT_KNOBS:
+                val = _expand_placement(val)
+            knobs[knob_key] = val
+
+    # fill missing with defaults
+    for k, v in _DEFAULT_KNOB_VALUES.items():
+        if k not in knobs:
+            knobs[k] = v
+
+    return knobs
+
+
+# --- validation --------------------------------------------------------------
 
 class PreflightError(ValueError):
     pass
@@ -79,7 +179,7 @@ class PreflightError(ValueError):
 
 def resolve(overrides: dict, baseline: dict | None = None) -> dict:
     """Apply an override delta on top of the baseline knobs → resolved knobs."""
-    base = dict(baseline or BASELINE_KNOBS)
+    base = dict(baseline or _DEFAULT_KNOB_VALUES)
     for k, v in (overrides or {}).items():
         if k not in TUNABLE_KNOBS:
             raise PreflightError(f"knob not tunable / unknown: {k}")
@@ -91,7 +191,6 @@ def _parse_range(s):
     """'a-b' (inclusive) → world size (# ranks). Returns (size, lo, hi)."""
     s = str(s).strip()
     if "-" not in s:
-        # single GPU index
         i = int(s)
         return 1, i, i
     lo, hi = s.split("-", 1)
@@ -130,18 +229,18 @@ def validate(resolved_knobs: dict):
     v: list[str] = []
     _typecheck(resolved_knobs, v)
     if v:
-        return False, v  # don't run divisibility on ill-typed values
+        return False, v
 
     # world sizes from placement
     actor_world = _parse_range(resolved_knobs["cluster.component_placement.actor"])[0]
     env_world = _parse_range(resolved_knobs["cluster.component_placement.env"])[0]
-    _rollout_world = _parse_range(resolved_knobs["cluster.component_placement.rollout"])[0]
+    rollout_world = _parse_range(resolved_knobs["cluster.component_placement.rollout"])[0]
 
     mbs = resolved_knobs["actor.micro_batch_size"]
-    gbs = resolved_knobs.get("actor.global_batch_size", 640)
+    gbs = resolved_knobs.get("actor.global_batch_size", 16384)
     tne = resolved_knobs["env.train.total_num_envs"]
     stage = resolved_knobs["rollout.pipeline_stage_num"]
-    group = resolved_knobs.get("algorithm.group_size", 1)
+    group = resolved_knobs.get("algorithm.group_size", 8)
 
     # actor batch: global_batch_size % (micro_batch_size * actor_world) == 0
     denom = mbs * actor_world
@@ -162,18 +261,34 @@ def validate(resolved_knobs: dict):
             elif group and chunk % group != 0:
                 v.append(f"(total_num_envs/env_world/stage={chunk}) % group_size({group}) != 0")
 
+    # rollout / actor world divisibility (invariants 7-8 from knob-schema.md)
+    if rollout_world > 0 and chunk > 0 and chunk % rollout_world != 0:
+        v.append(f"(total_num_envs/env_world/stage={chunk}) % rollout_world({rollout_world}) != 0")
+    if actor_world > 0 and chunk > 0 and chunk % actor_world != 0:
+        v.append(f"(total_num_envs/env_world/stage={chunk}) % actor_world({actor_world}) != 0")
+
     return (len(v) == 0), v
 
+
+# --- CLI --------------------------------------------------------------------
 
 def _main():
     ap = argparse.ArgumentParser(description="Preflight-validate an RLinf config proposal.")
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--overrides", help="JSON delta applied on baseline, e.g. '{\"actor.micro_batch_size\":40}'")
     g.add_argument("--resolved", help="JSON of a full resolved knob dict")
-    ap.add_argument("--baseline", help="JSON baseline knob dict (default: built-in maniskill baseline)")
+    ap.add_argument("--config", help="Path to config YAML to read baseline knobs from (e.g. examples/embodiment/config/libero_10_grpo_openvlaoft.yaml)")
+    ap.add_argument("--baseline", help="JSON baseline knob dict (overrides --config)")
     args = ap.parse_args()
 
-    baseline = json.loads(args.baseline) if args.baseline else None
+    # resolve baseline
+    if args.baseline:
+        baseline = json.loads(args.baseline)
+    elif args.config:
+        baseline = load_baseline_from_config(args.config)
+    else:
+        baseline = None  # use _DEFAULT_KNOB_VALUES
+
     if args.resolved:
         knobs = json.loads(args.resolved)
     else:
