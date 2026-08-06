@@ -18,7 +18,7 @@ for round r in 1..10:
     for each of the (up to) 4 proposals d on parent f:
         dedup d       → if duplicate, skip (reuse known objective)
         preflight d   → if invalid, record FAILED/CONFIG_INVALID, re-propose or drop
-        else: launch trial (short) → diagnose → add node, set objective
+        else: launch trial (short) → diagnose+REPORT → add node, set objective
     print tree + leaderboard
 finish: best node → SEARCH_REPORT.md
 ```

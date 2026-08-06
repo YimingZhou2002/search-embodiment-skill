@@ -76,8 +76,8 @@ For `r` in `1..ROUNDS`:
    a. **dedup:** `search_store.py dedup --campaign-dir "$CAMPAIGN" --parent P --overrides '<d>'`.
       If `duplicate`, skip the run (reuse the known objective); optionally record a
       `--status DUPLICATE` node for provenance. Propose a different delta.
-   b. **preflight:** `python "$SKILL/helpers/preflight.py" --overrides '<d>'`
-      (or pass the resolved config). If invalid, record it without running:
+   b. **preflight:** `python "$SKILL/helpers/preflight.py" --config "$RLINF_ROOT/examples/embodiment/config/<CONFIG>.yaml" --overrides '<d>'`
+      This loads the real config's baseline knobs (e.g. `global_batch_size`, `total_num_envs`) so validation uses actual values, not hardcoded defaults. If invalid, record it without running:
       `search_store.py add … --status FAILED --failure CONFIG_INVALID`; propose another.
    c. **Launch trial** `d` (see "Launch a trial" below) into `$CAMPAIGN/node_<next>-<tag>`,
       then plot, diagnose, and register:

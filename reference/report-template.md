@@ -18,6 +18,9 @@ and the model in [`concepts.md`](concepts.md).
 
 **Run:** `<log_dir>`
 **Config name:** `<config-name>`
+**Model:** `<model-name, e.g. openpi, openvla>`
+**Env:** `<sim-env-name, e.g. maniskill, libero,robotwin>`
+**Algorithm:** `<algorithm-name, e.g. ppo, grpo>`
 **Run Mode:** `<sync/async>`
 **Config knobs:** `<fill-in according to log-dir/tensorboard/config.yaml>`
 cluster:
