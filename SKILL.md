@@ -56,6 +56,15 @@ python "$SKILL/helpers/search_store.py" set-result \
   --campaign-dir "$CAMPAIGN" --id 0 --from-diagnosis "$CAMPAIGN/node_0-baseline/diagnosis.json"
 ```
 
+Then, **before round 1**, run the worker-level atomic-modeling sweep **once** to build
+per-component cost/scaling models for this config — see
+[Worker-level atomic modeling](#worker-level-atomic-modeling-cold-start-profiling).
+The whole-config baseline tells you the *current* bottleneck; the atomic sweep tells you
+*how each component scales* with its knob, which is what the proposals in every round
+draw on. Run it after the baseline and keep its curves alongside the campaign.
+
+
+
 ### 2. Rounds
 For `r` in `1..ROUNDS`:
 
@@ -71,7 +80,11 @@ For `r` in `1..ROUNDS`:
    [`reference/knob-schema.md`](reference/knob-schema.md), and
    [`reference/diagnosis-playbook.md`](reference/diagnosis-playbook.md).
    Each delta is a small JSON of hydra overrides, e.g.
-   `{"env.train.enable_offload": false}`.
+   `{"env.train.enable_offload": false}`. For knobs whose effect is a per-component
+   **scaling curve** (env `num_envs`, rollout batch size, actor `micro_batch_size`),
+   prefer proposing from the atomic-modeling sweep's measured curves (built once at
+   cold start) over guessing — see
+   [Worker-level atomic modeling](#worker-level-atomic-modeling-cold-start-profiling).
 3. **For each proposal** `d` on parent `P` (up to `BEAM×BRANCH` = 4):
    a. **dedup:** `search_store.py dedup --campaign-dir "$CAMPAIGN" --parent P --overrides '<d>'`.
       If `duplicate`, skip the run (reuse the known objective); optionally record a
@@ -115,6 +128,42 @@ python "$SKILL/helpers/search_store.py" best --campaign-dir "$CAMPAIGN"
 Write `$CAMPAIGN/SEARCH_REPORT.md`: the winning config (its cumulative overrides +
 resolved knobs), the leaderboard, per-round progression, and the dead-ends (OOM /
 invalid / duplicates). Report the best config and its speedup vs baseline to the user.
+
+## Worker-level atomic modeling (cold-start profiling)
+
+Run this **once, right after the baseline is evaluated** (step 1), before round 1.
+Beyond whole-config trials, RLinf ships a **per-component atomic-modeling harness**
+(`examples/embodiment/run_sweep.sh` → `benchmark_sweep.py`) that isolates the three
+workers on **disjoint GPUs** and sweeps each one's scaling knob independently, so you
+get a clean cost curve per component without cross-component interference. It measures
+compute time and VRAM/HBM (plus env CPU% / host-RAM / GPU-util) for: **env**
+`num_envs`, **rollout** batch size, and **actor** `micro_batch_size` (with
+`global_batch_size` pinned). Seeds are captured inline; results land in
+`<log_dir>/bench_msgs/sweep_{env_interact,rollout_predict,actor_micro_batch}.json|csv`.
+
+Pin the output under the campaign dir so the curves live with the search, then read
+each component's curve to seed proposals: does step time / peak HBM grow sub-linearly
+(headroom to push the knob) or is it already saturated / near-OOM (back off)? Every
+round's `micro_batch_size` / batch / env-parallelism proposal should cite the matching
+curve and cross-check the target point against the sweep's OOM/peak-HBM column, rather
+than guessing.
+
+```bash
+# one-off at cold start, per CONFIG; disjoint-GPU sweep of env/rollout/actor.
+# GPU-exclusive like a trial — gpu_check first.
+bash "$SKILL/scripts/gpu_check.sh" || { echo "GPUs busy — wait"; }
+cd "$RLINF_ROOT" && source "$VENV/bin/activate" && \
+RLINF_BENCH_OUT="$CAMPAIGN/atomic_model" RLINF_BENCH_ENV_MAX=64 \
+  bash examples/embodiment/run_sweep.sh <CONFIG>
+```
+
+Caveat (RoboTwin/SAPIEN): the **env** axis builds a fresh `num_envs`-wide sim per point
+on a single GPU and leaks TLS pthread-keys, so large `num_envs` points can hit an
+**uncatchable native SIGABRT**. Bound it with `RLINF_BENCH_ENV_MAX` (RoboTwin: `64`);
+already-measured rows survive in `sweep_env_interact.partial.jsonl`. See
+`examples/embodiment/run_sweep.sh` header for all knobs. This harness **profiles/models
+the workers only** — it does not launch or register search nodes; the beam search still
+drives the actual trials.
 
 ## Launch a trial (the per-node eval)
 

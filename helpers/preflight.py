@@ -162,6 +162,14 @@ def load_baseline_from_config(config_path: str) -> dict:
             if knob_key in _PLACEMENT_KNOBS:
                 val = _expand_placement(val)
             knobs[knob_key] = val
+        elif knob_key in _PLACEMENT_KNOBS:
+            # placement may be nested under a non-flattened parent dict
+            # e.g. "cluster.component_placement" = {"actor":"0-7","env":"0-3","rollout":"4-7"}
+            parts = yaml_path.rsplit(".", 1)
+            if len(parts) == 2 and parts[0] in flat:
+                parent = flat[parts[0]]
+                if isinstance(parent, dict) and parts[1] in parent:
+                    knobs[knob_key] = _expand_placement(parent[parts[1]])
 
     # fill missing with defaults
     for k, v in _DEFAULT_KNOB_VALUES.items():
