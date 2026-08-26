@@ -53,6 +53,47 @@ mapping:
   `rollout.enable_offload=false` unless placement was disaggregated first — those
   are known OOMs, wasted trials.
 
+## Using the wiki (cross-campaign knowledge)
+
+Before proposing knob deltas, query the wiki for relevant past experience:
+
+```bash
+python "$SKILL/wiki/wiki_index.py" query \
+  --wiki-dir "$SKILL/wiki" \
+  --env "$ENV_NAME" --model "$MODEL_NAME" --algorithm "$ALGO_NAME"
+```
+
+This returns paths to wiki entries ranked by relevance. Read the top 1-3 entries.
+
+### How to use wiki knowledge
+
+1. **Check known knob sensitivity.** If the wiki entry for this env/model/algo says
+   a knob has a strong effect in a certain direction, prioritize that direction.
+   Example: wiki says "ManiSkill + OpenVLA-OFT: collocation (env, rollout in 0-7)
+   gives -50% improvement" -> propose collocation changes early.
+
+2. **Avoid known dead ends.** If the wiki lists OOM walls or invalid configs for
+   this env/model/algo, do not propose them. Example: wiki says "micro_batch_size
+   > 108 -> OOM for OpenVLA-OFT on 80GiB GPUs" -> keep mbs <= 108.
+
+3. **Get component memory footprint.** The wiki's Memory & Bottleneck Profile section
+   tells you the peak memory of each component. Use this to make informed offload
+   decisions: if actor+rollout+env > 80% of total GPU memory, keep offload enabled.
+
+4. **Cross-campaign knob effects.** The `knob-effect/` entries aggregate experience
+   across all campaigns. If a knob consistently shows a positive effect across
+   different env/model combinations, it's worth trying. If it shows mixed results,
+   note the conditions under which it works.
+
+### Priority
+
+- **High-confidence wiki entries** override the default playbook for their
+  specific dimension. If a high-confidence wiki entry says a knob is harmful,
+  do not propose it.
+- **Medium/low-confidence entries** are advisory - use them as hints but still
+  follow the diagnosis-playbook patterns.
+- **No wiki entry** -> fall back to the full diagnosis-playbook heuristic.
+
 ## Guardrails (always, before launching)
 
 1. **dedup** (`search_store.py dedup --parent f --overrides d`): if it returns a

@@ -232,7 +232,7 @@ def _typecheck(knobs, violations):
             violations.append(f"{k}={v!r} outside 0-{NUM_GPUS-1} or reversed")
 
 
-def validate(resolved_knobs: dict):
+def validate(resolved_knobs: dict, max_tne_epoch_product: int | None = None):
     """Return (ok: bool, violations: list[str]) for a resolved knob dict."""
     v: list[str] = []
     _typecheck(resolved_knobs, v)
@@ -275,6 +275,17 @@ def validate(resolved_knobs: dict):
     if actor_world > 0 and chunk > 0 and chunk % actor_world != 0:
         v.append(f"(total_num_envs/env_world/stage={chunk}) % actor_world({actor_world}) != 0")
 
+    # tne * rollout_epoch ≤ 8× baseline
+    if max_tne_epoch_product is not None:
+        tne = resolved_knobs["env.train.total_num_envs"]
+        epoch = resolved_knobs["env.train.rollout_epoch"]
+        product = tne * epoch
+        if product > max_tne_epoch_product:
+            v.append(
+                f"total_num_envs({tne}) * rollout_epoch({epoch}) = {product} "
+                f"> max allowed ({max_tne_epoch_product} = 8× baseline)"
+            )
+
     return (len(v) == 0), v
 
 
@@ -297,6 +308,12 @@ def _main():
     else:
         baseline = None  # use _DEFAULT_KNOB_VALUES
 
+    # compute max tne*epoch product = 8 × baseline
+    baseline_for_product = baseline if baseline is not None else _DEFAULT_KNOB_VALUES
+    base_tne = baseline_for_product.get("env.train.total_num_envs", 64)
+    base_epoch = baseline_for_product.get("env.train.rollout_epoch", 1)
+    max_tne_epoch_product = base_tne * base_epoch * 8
+
     if args.resolved:
         knobs = json.loads(args.resolved)
     else:
@@ -306,7 +323,7 @@ def _main():
             print(json.dumps({"ok": False, "violations": [str(e)], "resolved": None}, indent=2))
             raise SystemExit(1)
 
-    ok, violations = validate(knobs)
+    ok, violations = validate(knobs, max_tne_epoch_product=max_tne_epoch_product)
     print(json.dumps({"ok": ok, "violations": violations,
                       "resolved": knobs}, indent=2))
     raise SystemExit(0 if ok else 1)

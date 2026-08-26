@@ -109,13 +109,12 @@ while GPUs legitimately wait — then raising GPU util means fixing the CPU side
   env workers hit ~5600% ≈ 56 cores).
 - env `avg_process_gpu_util` ~ 0 while `env_interact_step` is a large share of the
   generation phase (`generation_internals.env_interact_pct_of_generation` high).
+- `atomic-profile-report.md` and atomic profile shows that env worker GPU-utilization are below 50%
 
 **Why:** physics/render sim is CPU-side; if it dominates the generation phase, the
 step is gated by CPU throughput, not GPU.
 
-**First-line fix:** more env worker processes / more cores per node; a faster or
-GPU-accelerated sim backend; raise `total_num_envs` so per-step CPU overhead
-amortizes (Pattern I).
+**First-line fix:** collocation of env and rollout workers (`cluster.env: all` and `cluster.rollout: all`) will spawn more env worker processes, and spawn more rollout workers than disaggrated placement(worker instance num = component placement GPU num); Setting `pipeline_stage_num: 2` allows env and rollout workers to run on the same device at the same time(when env hardly utilzd GPUs, rollout could use them instead). raise `total_num_envs` so per-step CPU overhead amortizes (Pattern I).
 
 
 **Exceptions:** if `predict_pct_of_generation` dominates instead, the rollout
@@ -179,7 +178,7 @@ amortized over few trajectories, so per-trajectory cost blows up.
 64→128) and keep `micro_batch_size` ≥ ~80; both amortize overhead and are memory-
 safe with offload on (Pattern G / [`concepts.md`](concepts.md) §7).
 
-**Exceptions:** memory- or CPU-limited setups cap how far you can push — raise
+**Exceptions:** Do not raise `total_num_envs*rollout_epoch` to more than 4 times of the baseline knob value. The product of these 2 value denotes number of samples generated and trained within one step. Raising too much will affect RL algorithm's integrity and results in degradation of `success_once` standard. memory- or CPU-limited setups cap how far you can push — raise
 until `memory.oom_risk` leaves `safe` or env CPU saturates (Pattern F).
 
 ---

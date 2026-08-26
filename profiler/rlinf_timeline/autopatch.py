@@ -37,6 +37,7 @@ _PATCHED: set[tuple[str, str]] = set()
 _DEFERRED_SPECS: list[PatchSpec] = []
 _WORKER_TIMER_PATCHED = False
 _ACTOR_TRAINING_PATCHED = False
+_PIPELINE_ACTOR_TRAINING_PATCHED = False
 _WORKER_NVML_PATCHED = False
 _RUNNER_NVML_PATCHED: set[str] = set()
 _BEHAVIOR_NVML_PATCHED = False
@@ -1426,6 +1427,240 @@ def _install_worker_timer_from_env() -> None:
         _debug("installed Worker.timer import hook")
 
 
+def _patch_pipeline_actor_training_module(module: ModuleType) -> None:
+    """Patch PipelineEmbodiedFSDPActor.run_training for actor training timeline.
+
+    PipelineEmbodiedFSDPActor overrides run_training in a separate module
+    (fsdp_actor_worker_pipeline), so we need a dedicated patch that targets
+    that class.  The logic is identical to _patch_actor_training_module but
+    resolves policy_loss from the parent module since it isn't re-imported
+    in the pipeline module.
+    """
+    global _PIPELINE_ACTOR_TRAINING_PATCHED
+    if _PIPELINE_ACTOR_TRAINING_PATCHED:
+        return
+
+    actor_cls = getattr(module, "PipelineEmbodiedFSDPActor", None)
+    if actor_cls is None:
+        _debug("PipelineEmbodiedFSDPActor not found for pipeline actor training patch")
+        return
+
+    original_run_training = getattr(actor_cls, "run_training", None)
+    if original_run_training is None or getattr(
+        original_run_training, "_rlinf_timeline_actor_training_wrapped", False
+    ):
+        _PIPELINE_ACTOR_TRAINING_PATCHED = True
+        return
+
+    # Resolve policy_loss from the parent module (fsdp_actor_worker) since
+    # the pipeline module doesn't re-import it.
+    parent_module = sys.modules.get("rlinf.workers.actor.fsdp_actor_worker")
+    original_policy_loss = getattr(parent_module, "policy_loss", None) if parent_module else None
+
+    @functools.wraps(original_run_training)
+    def run_training_wrapper(self, *args, **kwargs):
+        _ensure_resource_sampling_for_object(self)
+        state: dict[str, Any] = {
+            "microbatch_index": -1,
+            "forward_count": 0,
+            "policy_loss_count": 0,
+            "backward_count": 0,
+            "optimizer_step_count": 0,
+        }
+
+        model = getattr(self, "model", None)
+        model_cls = type(model) if model is not None else None
+        original_model_call = getattr(model_cls, "__call__", None) if model_cls else None
+
+        def model_call_wrapper(model_self, *m_args, **m_kwargs):
+            if model_self is not model:
+                return original_model_call(model_self, *m_args, **m_kwargs)
+            state["microbatch_index"] = int(state.get("forward_count", 0))
+            state["forward_count"] = int(state["forward_count"]) + 1
+            t0 = time.time()
+            error = None
+            try:
+                return original_model_call(model_self, *m_args, **m_kwargs)
+            except Exception as exc:
+                error = type(exc).__name__
+                raise
+            finally:
+                extra = {
+                    "qualname": f"{model_cls.__module__}.{model_cls.__qualname__}.__call__",
+                    "model_class": model_cls.__qualname__,
+                    "compute_logprobs": m_kwargs.get("compute_logprobs", None),
+                    "compute_entropy": m_kwargs.get("compute_entropy", None),
+                    "compute_values": m_kwargs.get("compute_values", None),
+                }
+                if error:
+                    extra["exception"] = error
+                _append_actor_training_event(
+                    self,
+                    state,
+                    phase="forward",
+                    tag="actor_forward",
+                    t0=t0,
+                    t1=time.time(),
+                    extra=extra,
+                )
+
+        @functools.wraps(original_policy_loss)
+        def policy_loss_wrapper(*pl_args, **pl_kwargs):
+            state["policy_loss_count"] = int(state.get("policy_loss_count", 0)) + 1
+            t0 = time.time()
+            error = None
+            try:
+                return original_policy_loss(*pl_args, **pl_kwargs)
+            except Exception as exc:
+                error = type(exc).__name__
+                raise
+            finally:
+                extra = {
+                    "qualname": "rlinf.workers.actor.fsdp_actor_worker.policy_loss",
+                    "loss_type": pl_kwargs.get("loss_type", None),
+                    "logprob_type": pl_kwargs.get("logprob_type", None),
+                    "reward_type": pl_kwargs.get("reward_type", None),
+                    "critic_warmup": pl_kwargs.get("critic_warmup", None),
+                }
+                if error:
+                    extra["exception"] = error
+                _append_actor_training_event(
+                    self,
+                    state,
+                    phase="policy_loss",
+                    tag="actor_policy_loss",
+                    t0=t0,
+                    t1=time.time(),
+                    extra=extra,
+                )
+
+        try:
+            import torch
+            original_backward = torch.Tensor.backward
+        except Exception:
+            torch = None
+            original_backward = None
+
+        def backward_wrapper(tensor_self, *bw_args, **bw_kwargs):
+            state["backward_count"] = int(state.get("backward_count", 0)) + 1
+            t0 = time.time()
+            error = None
+            try:
+                return original_backward(tensor_self, *bw_args, **bw_kwargs)
+            except Exception as exc:
+                error = type(exc).__name__
+                raise
+            finally:
+                extra = {"qualname": "torch.Tensor.backward"}
+                if error:
+                    extra["exception"] = error
+                _append_actor_training_event(
+                    self,
+                    state,
+                    phase="backward",
+                    tag="actor_backward",
+                    t0=t0,
+                    t1=time.time(),
+                    extra=extra,
+                )
+
+        original_optimizer_step = getattr(self, "optimizer_step")
+
+        @functools.wraps(original_optimizer_step)
+        def optimizer_step_wrapper(*opt_args, **opt_kwargs):
+            state["optimizer_step_count"] = int(state.get("optimizer_step_count", 0)) + 1
+            t0 = time.time()
+            error = None
+            try:
+                return original_optimizer_step(*opt_args, **opt_kwargs)
+            except Exception as exc:
+                error = type(exc).__name__
+                raise
+            finally:
+                extra = {"qualname": f"{type(self).__qualname__}.optimizer_step"}
+                if error:
+                    extra["exception"] = error
+                _append_actor_training_event(
+                    self,
+                    state,
+                    phase="optimizer_step",
+                    tag="actor_optimizer_step",
+                    t0=t0,
+                    t1=time.time(),
+                    extra=extra,
+                )
+
+        patches = []
+        if model_cls is not None and original_model_call is not None:
+            patches.append(_ScopedPatch(model_cls, "__call__", model_call_wrapper))
+        if original_policy_loss is not None:
+            patches.append(_ScopedPatch(parent_module, "policy_loss", policy_loss_wrapper))
+        if torch is not None and original_backward is not None:
+            patches.append(_ScopedPatch(torch.Tensor, "backward", backward_wrapper))
+        patches.append(_ScopedPatch(self, "optimizer_step", optimizer_step_wrapper))
+
+        exits = []
+        try:
+            for patch in patches:
+                patch.__enter__()
+                exits.append(patch)
+            return original_run_training(self, *args, **kwargs)
+        finally:
+            for patch in reversed(exits):
+                patch.__exit__(None, None, None)
+
+    run_training_wrapper._rlinf_timeline_actor_training_wrapped = True  # type: ignore[attr-defined]
+    setattr(actor_cls, "run_training", run_training_wrapper)
+    _PIPELINE_ACTOR_TRAINING_PATCHED = True
+    _debug("patched PipelineEmbodiedFSDPActor.run_training for actor training timeline")
+
+
+class _PipelineActorTrainingLoader(importlib.abc.Loader):
+    def __init__(self, loader: importlib.abc.Loader) -> None:
+        self.loader = loader
+
+    def create_module(self, spec):
+        create_module = getattr(self.loader, "create_module", None)
+        if create_module is None:
+            return None
+        return create_module(spec)
+
+    def exec_module(self, module: ModuleType) -> None:
+        self.loader.exec_module(module)  # type: ignore[attr-defined]
+        _patch_pipeline_actor_training_module(module)
+        if _resource_sampling_enabled() and module.__name__.startswith(_RunnerNVMLFinder.MODULE_PREFIX):
+            _patch_runner_nvml_module(module)
+
+
+class _PipelineActorTrainingFinder(importlib.abc.MetaPathFinder):
+    MODULE = "rlinf.workers.actor.fsdp_actor_worker_pipeline"
+
+    def find_spec(self, fullname: str, path: Any, target: Any = None):
+        if fullname != self.MODULE:
+            return None
+        found = importlib.machinery.PathFinder.find_spec(fullname, path)
+        if found is None or found.loader is None:
+            return found
+        if isinstance(found.loader, _PipelineActorTrainingLoader):
+            return found
+        found.loader = _PipelineActorTrainingLoader(found.loader)
+        return found
+
+
+def _install_pipeline_actor_training_from_env() -> None:
+    """Install pipeline actor training timeline patching.
+
+    PipelineEmbodiedFSDPActor lives in fsdp_actor_worker_pipeline, a
+    separate module from the base EmbodiedFSDPActor, so it needs its own
+    MetaPathFinder.  Controlled by the same env var so both are enabled
+    together.
+    """
+    if os.environ.get("RLINF_TIMELINE_ACTOR_TRAINING") == "1":
+        _PIPELINE_ACTOR_TRAINING_PATCHED = False
+        sys.meta_path.insert(0, _PipelineActorTrainingFinder())
+        _debug("pipeline actor training timeline patching enabled (RLINF_TIMELINE_ACTOR_TRAINING=1)")
+
+
 def _install_actor_training_from_env() -> None:
     if os.environ.get("RLINF_TIMELINE_ACTOR_TRAINING", "").lower() not in {
         "1",
@@ -1488,6 +1723,7 @@ def install_from_env() -> None:
     _install_nvml_from_env()
     _install_worker_timer_from_env()
     _install_actor_training_from_env()
+    _install_pipeline_actor_training_from_env()
 
     specs = _read_patch_specs()
     if not specs:
