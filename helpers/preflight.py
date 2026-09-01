@@ -275,15 +275,15 @@ def validate(resolved_knobs: dict, max_tne_epoch_product: int | None = None):
     if actor_world > 0 and chunk > 0 and chunk % actor_world != 0:
         v.append(f"(total_num_envs/env_world/stage={chunk}) % actor_world({actor_world}) != 0")
 
-    # tne * rollout_epoch ≤ 8× baseline
+    # tne * rollout_epoch must equal baseline product (invariant 9 from knob-schema.md)
     if max_tne_epoch_product is not None:
         tne = resolved_knobs["env.train.total_num_envs"]
         epoch = resolved_knobs["env.train.rollout_epoch"]
         product = tne * epoch
-        if product > max_tne_epoch_product:
+        if product != max_tne_epoch_product:
             v.append(
                 f"total_num_envs({tne}) * rollout_epoch({epoch}) = {product} "
-                f"> max allowed ({max_tne_epoch_product} = 8× baseline)"
+                f"!= baseline product ({max_tne_epoch_product}) — product must stay constant"
             )
 
     return (len(v) == 0), v
@@ -296,7 +296,7 @@ def _main():
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--overrides", help="JSON delta applied on baseline, e.g. '{\"actor.micro_batch_size\":40}'")
     g.add_argument("--resolved", help="JSON of a full resolved knob dict")
-    ap.add_argument("--config", help="Path to config YAML to read baseline knobs from (e.g. examples/embodiment/config/libero_10_grpo_openvlaoft.yaml)")
+    ap.add_argument("--config", help="Path to config YAML to read baseline knobs from (e.g. examples/<type>/config/<name>.yaml)")
     ap.add_argument("--baseline", help="JSON baseline knob dict (overrides --config)")
     args = ap.parse_args()
 
@@ -312,7 +312,7 @@ def _main():
     baseline_for_product = baseline if baseline is not None else _DEFAULT_KNOB_VALUES
     base_tne = baseline_for_product.get("env.train.total_num_envs", 64)
     base_epoch = baseline_for_product.get("env.train.rollout_epoch", 1)
-    max_tne_epoch_product = base_tne * base_epoch * 8
+    max_tne_epoch_product = base_tne * base_epoch
 
     if args.resolved:
         knobs = json.loads(args.resolved)

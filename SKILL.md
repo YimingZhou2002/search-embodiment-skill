@@ -1,5 +1,5 @@
 ---
-name: search-embodiment
+name: search-embodiment-skill
 description: Search for the best-performing RLinf embodiment config via a beam search over config knobs, profiling each trial. Use when the user wants to auto-tune / optimize / search embodiment training configs (e.g. "find the best config for maniskill_ppo_openvla", "tune the embodiment run", "search configs"). Cold-starts from the baseline, then each round expands the 2 best nodes with 2 proposed knob deltas each (4 profiled trials/round), maintaining a node tree and leaderboard.
 ---
 
@@ -34,12 +34,13 @@ for ranking.
 
 - `PROJECT` = `$(pwd)` at invocation (repo folder).
 - `RLINF_ROOT` = `${RLINF_ROOT:-$PROJECT/RLinf}`.
-- `SKILL` = `$PROJECT/.claude/skills/search-embodiment` .
+- `SKILL` = `$PROJECT/.claude/skills/search-embodiment-skill` .
 - `VENV` = `${EMBODIMENT_VENV:-${VIRTUAL_ENV:-/root/venv/openvla}}`.
 - `WIKI` = `$SKILL/wiki` — holds cross-campaign wiki entries (env, model, algorithm, cfg, knob-effect).
 - `CAMPAIGN` = `$RLINF_ROOT/logs/search_<timestamp>/` — holds `nodes.jsonl`,
   `tree.json`, `SEARCH_REPORT.md`, and per-trial dirs `node_<id>-<tag>/`.
 - `CONFIG` = the config to tune (default `maniskill_ppo_openvla`, or the skill arg).
+- `CONFIG_TYPE` = resolved via `"$SKILL/scripts/resolve_config_type.sh" "$CONFIG" "$RLINF_ROOT"` (e.g., `embodiment`).
 - `STEPS` = trial length (default small, e.g. `2`; overridable).
 
 ## 3. Worker-level atomic modeling (cold-start profiling)
@@ -48,7 +49,7 @@ for ranking.
 > The search loop depends on these curves. Without them, every proposal is a guess.
 
 Beyond whole-config trials, RLinf ships a **per-component atomic-modeling harness**
-(`examples/embodiment/run_sweep.sh` → `benchmark_sweep.py`) that isolates the three
+(`examples/benchmark/run_sweep.sh` → `benchmark_sweep.py`) that isolates the three
 workers on **disjoint GPUs** and sweeps each one's scaling knob independently, so you
 get a clean cost curve per component without cross-component interference. It measures
 compute time and VRAM/HBM (plus env CPU% / host-RAM / GPU-util) for: **env**
@@ -69,16 +70,28 @@ than guessing.
 bash "$SKILL/scripts/gpu_check.sh" || { echo "GPUs busy — wait"; }
 cd "$RLINF_ROOT" && source "$VENV/bin/activate" && \
 RLINF_BENCH_OUT="$CAMPAIGN/atomic_model" RLINF_BENCH_ENV_MAX=64 \
-  bash examples/embodiment/run_sweep.sh <CONFIG>
+  bash examples/benchmark/run_sweep.sh <CONFIG>
 ```
 
 Caveat (RoboTwin/SAPIEN): the **env** axis builds a fresh `num_envs`-wide sim per point
 on a single GPU and leaks TLS pthread-keys, so large `num_envs` points can hit an
 **uncatchable native SIGABRT**. Bound it with `RLINF_BENCH_ENV_MAX` (RoboTwin: `64`);
 already-measured rows survive in `sweep_env_interact.partial.jsonl`. See
-`examples/embodiment/run_sweep.sh` header for all knobs. This harness **profiles/models
+`examples/benchmark/run_sweep.sh` header for all knobs. This harness **profiles/models
 the workers only** — it does not launch or register search nodes; the beam search still
 drives the actual trials.
+
+> **✅ After the sweep finishes — write the atomic-profile report.** Do not leave the
+> curves undocumented. Read the three `sweep_*.json` result files in
+> `$CAMPAIGN/atomic_model/bench_msgs/`, cross-check them against the baseline node's
+> `diagnosis.json` (which one to treat as the "diagnose" input: it names the
+> whole-config bottleneck the curves must explain), then fill
+> [`reference/atomic-profile-report-template.md`](reference/atomic-profile-report-template.md)
+> and save it to `$CAMPAIGN/atomic_model/bench_msgs/atomic-profile-report.md`. Cite the
+> measured field behind every claim (e.g. "env step_ms=54,966 at num_envs=64"), state
+> the per-component bottleneck hierarchy, and flag any knob already near-OOM so later
+> proposals avoid it. This report is the evidence source every round's scaling-knob
+> proposal draws on.
 
 ## 4. Launch a trial (the per-node eval)
 
@@ -101,7 +114,7 @@ source "$VENV/bin/activate" && \
 source "$SKILL/profiler/enable_nvitop.sh" && \
 source "$SKILL/profiler/enable_timeline.sh" && \
 STEPS=2 RUN_LOG_DIR="$NODE_DIR" EXTRA_OVERRIDES="<OV>" \
-  bash examples/embodiment/run_embodiment.sh <CONFIG>
+  bash examples/$CONFIG_TYPE/run_embodiment.sh <CONFIG>
 
 # after it exits: plot + diagnose (writes NODE_DIR/diagnosis.json)
 python "$SKILL/profiler/plot_timeline.py" "$NODE_DIR/timeline" -o "$NODE_DIR/timeline.png"  --format png
@@ -121,7 +134,7 @@ After the shell exits and `diagnosis.json` is written, proceed to
 [§5 Write per-node REPORT.md](#5-write-per-node-reportmd).
 
 **External dependency** on the additive `RUN_LOG_DIR`/`EXTRA_OVERRIDES` passthrough
-in `RLinf/examples/embodiment/run_embodiment.sh`.
+in `RLinf/examples/$CONFIG_TYPE/run_embodiment.sh`.
 
 ## 5. Write per-node REPORT.md
 
@@ -235,7 +248,7 @@ For `r` in `1..ROUNDS`:
    a. **dedup:** `search_store.py dedup --campaign-dir "$CAMPAIGN" --parent P --overrides '<d>'`.
       If `duplicate`, skip the run (reuse the known objective); optionally record a
       `--status DUPLICATE` node for provenance. Propose a different delta.
-   b. **preflight:** `python "$SKILL/helpers/preflight.py" --config "$RLINF_ROOT/examples/embodiment/config/<CONFIG>.yaml" --overrides '<d>'`
+   b. **preflight:** `python "$SKILL/helpers/preflight.py" --config "$RLINF_ROOT/examples/$CONFIG_TYPE/config/<CONFIG>.yaml" --overrides '<d>'`
       This loads the real config's baseline knobs (e.g. `global_batch_size`, `total_num_envs`) so validation uses actual values, not hardcoded defaults. If invalid, record it without running:
       `search_store.py add … --status FAILED --failure CONFIG_INVALID`; propose another.
    c. **Launch trial** `d` (see [§4 Launch a trial](#4-launch-a-trial-the-per-node-eval)) into `$CAMPAIGN/node_<next>-<tag>`,

@@ -114,7 +114,7 @@ while GPUs legitimately wait — then raising GPU util means fixing the CPU side
 **Why:** physics/render sim is CPU-side; if it dominates the generation phase, the
 step is gated by CPU throughput, not GPU.
 
-**First-line fix:** collocation of env and rollout workers (`cluster.env: all` and `cluster.rollout: all`) will spawn more env worker processes, and spawn more rollout workers than disaggrated placement(worker instance num = component placement GPU num); Setting `pipeline_stage_num: 2` allows env and rollout workers to run on the same device at the same time(when env hardly utilzd GPUs, rollout could use them instead). raise `total_num_envs` so per-step CPU overhead amortizes (Pattern I).
+**First-line fix:** Set `cluster.env: all`, `cluster.rollout: all` and `pipeline_stage_num: 2`.collocation of env and rollout workers (`cluster.env: all` and `cluster.rollout: all`) will spawn more env worker processes, and spawn more rollout workers than disaggrated placement(worker instance num = component placement GPU num); Setting `pipeline_stage_num: 2` allows env and rollout workers to run on the same device at the same time(when env hardly utilzd GPUs, rollout could use them instead). raise `total_num_envs` so per-step CPU overhead amortizes (Pattern I).
 
 
 **Exceptions:** if `predict_pct_of_generation` dominates instead, the rollout

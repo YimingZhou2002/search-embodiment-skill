@@ -6,12 +6,33 @@ bookkeeping is in `helpers/search_store.py` (node store + tree) and
 frontier node's diagnosis and pick knob deltas. Objective = `step_time_per_traj_s`
 (from `diagnosis.json`), **lower is better**.
 
+## Scoring: composite objective (A4)
+
+The frontier is selected by **composite score**, not raw `step_time_per_traj_s`.
+This prevents the beam from collapsing into a local optimum (a fast but memory-tight
+dead end). The composite score is:
+
+```
+composite = step_time_per_traj_s × (1 − α × max(0, headroom_gib − 5) / baseline_headroom)
+            − β × sqrt(ln(rounds + 1) / (children + 1))
+            + γ × max(0, baseline_success − node_success) / baseline_success
+```
+
+| Term | Coeff | What it does |
+|------|-------|-------------|
+| Headroom potential | α=0.15 | Gives nodes with GPU memory headroom a discount — they can still grow (raise mbs, disable offload) |
+| Exploration bonus | β=0.05 | UCB-style bonus for nodes with fewer children — ensures breadth in early rounds |
+| Quality penalty | γ=0.5 | Penalizes nodes that degrade `success_once` vs baseline — prevents false wins |
+
+Tune α/β/γ via `search_store.py frontier --composite --alpha 0.15 --beta 0.05 --gamma 0.5`.
+Pass `--no-composite` to revert to raw objective ranking.
+
 ## The loop (beam width 2, branching 2)
 
 ```
 cold start:  run baseline → diagnose → node #0 (root)
 for round r in 1..10:
-    frontier = 2 best OK nodes by objective        # search_store.py frontier --k 2 --max-children 2
+    frontier = 2 best OK nodes by composite score  # search_store.py frontier --k 2 --max-children 2
     for each frontier node f:
         read f's diagnosis.json + REPORT.md
         propose 2 knob deltas that should lower the objective   # you, using the playbook below
@@ -20,6 +41,7 @@ for round r in 1..10:
         preflight d   → if invalid, record FAILED/CONFIG_INVALID, re-propose or drop
         else: launch trial (short) → diagnose+REPORT → add node, set objective
     print tree + leaderboard
+    run exhaustion-check → if should_stop: break early   # B4: stop only when genuinely exhausted
 finish: best node → SEARCH_REPORT.md
 ```
 
@@ -106,8 +128,29 @@ This returns paths to wiki entries ranked by relevance. Read the top 1-3 entries
    resolved config. Propose the *incremental* change only; the store resolves the
    full config and computes the dedup SHA.
 
-## Stopping early
+## Stopping early (B4 — combined exhaustion check)
 
-If a full round produces no OK node that beats the current best (all duplicates,
-invalid, OOM, or slower), you may stop before round 10 and report the best so far —
-note the plateau in `SEARCH_REPORT.md`.
+After each round, run the exhaustion check to decide whether to stop:
+
+```bash
+python "$SKILL/helpers/search_store.py" exhaustion-check \
+  --campaign-dir "$CAMPAIGN_DIR" --k 2 --max-children 2 \
+  --min-headroom-gib 5.0 --min-rounds 5
+```
+
+The search stops **only when ALL four conditions are met**:
+
+| # | Condition | Meaning |
+|---|-----------|---------|
+| 1 | **Plateau** | Best objective hasn't improved for 2 consecutive rounds |
+| 2 | **Headroom exhausted** | Every frontier node has < 5 GiB headroom — can't push mbs/offload further |
+| 3 | **Offload trade exhausted** | No frontier node has env offload enabled with enough headroom to disable it |
+| 4 | **Minimum rounds** | At least 5 rounds completed — don't stop before the search has had a fair chance |
+
+If the verdict is `should_stop: true`, stop and report the best so far.
+Otherwise, continue — the search still has viable expansion paths.
+Note the verdict and reasons in `SEARCH_REPORT.md`.
+
+This replaces the old single-round plateau rule. A single unlucky round (all
+proposals hit duplicates or OOM) no longer kills the search; the search only
+stops when it is genuinely exhausted.

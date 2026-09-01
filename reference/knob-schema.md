@@ -39,7 +39,7 @@ Let `actor_world`, `env_world`, `rollout_world` = #GPUs in the actor / env / rol
 6. placement ranges are contiguous `"a-b"`, `0 ≤ a ≤ b ≤ 7`.
 7. `(total_num_envs / env_world / pipeline_stage_num) % rollout_world== 0`
 8. `(total_num_envs / env_world / pipeline_stage_num) % actor_world== 0`
-9. `total_num_envs * rollout_epoch ≤ 8 × baseline_product` (preflight enforces using the baseline from `--config`)
+9. `total_num_envs * rollout_epoch == baseline_product` — 乘积必须保持不变（upstream 调大则 downstream 必须等比例调小，反之亦然）
 
 **Coupling to watch:** changing `env` placement changes `env_world` → must
 re-check tne (invariants 2–5). Changing `actor` placement changes `actor_world`
